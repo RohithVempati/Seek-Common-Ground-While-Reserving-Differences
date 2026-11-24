@@ -11,6 +11,14 @@ import os
 
 from datasets.DistributedProxySampler import DistributedProxySampler
 
+def _to_1d_object_array(items):
+    """Force a 1-D object array of items, avoiding numpy broadcasting.
+    np.array(list_of_uniform_arrays, dtype=object) broadcasts to (N, H, W, C)
+    which breaks Image.fromarray in BasicDataset.__getitem__."""
+    arr = np.empty(len(items), dtype=object)
+    arr[:] = items
+    return arr
+
 
 def split_ssl_data(args, img, text, img_label, text_label, label, num_labels, num_classes, index=None, include_lb_to_ulb=True):
     """
@@ -22,8 +30,8 @@ def split_ssl_data(args, img, text, img_label, text_label, label, num_labels, nu
     """
     # data, target = np.array(data), np.array(target)
     img, text, img_label, text_label, label = (
-    np.array(img, dtype=object),
-    np.array(text, dtype=object),
+    _to_1d_object_array(img),
+    _to_1d_object_array(text),
     np.array(img_label, dtype=np.int64),
     np.array(text_label, dtype=np.int64),
     np.array(label, dtype=np.int64),

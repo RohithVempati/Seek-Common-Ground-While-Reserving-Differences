@@ -1,3 +1,7 @@
+# SCDR+A2SI runs are capped at 5,120 optimizer steps (10 epochs x 512 steps),
+# about 30 minutes at the target hardware throughput. A2SI's roughly 70-epoch
+# DVAD schedule is compressed here; results are not directly comparable.
+
 # import needed library
 import os
 import logging
@@ -14,7 +18,7 @@ import torch.multiprocessing as mp
 
 from utils import net_builder, get_logger, count_parameters, over_write_args_from_file
 from train_utils import TBLog, get_optimizer, get_cosine_schedule_with_warmup
-from models.main.main import S2_VER
+from models.main.main import S2_VER, TOTAL_STEPS
 from datasets.ssl_dataset import SSL_Dataset, ImageNetLoader, Emotion_SSL_Dataset
 from datasets.data_utils import get_data_loader
 
@@ -25,6 +29,12 @@ FI数据集与cifar10的切换: net部分，调整stride；数据集部分，SSL
 # os.environ['CUDA_VISIBLE_DEVICES'] = "0" 
 
 def main(args):
+    configured_steps = args.epoch * args.num_train_iter
+    if configured_steps > TOTAL_STEPS:
+        raise ValueError(
+            'Training is capped at {} steps; got {} (epoch * num_train_iter).'.format(
+                TOTAL_STEPS, configured_steps))
+
     '''
     For (Distributed)DataParallelism,
     main(args) spawn each process (main_worker) to each GPU.
@@ -213,9 +223,11 @@ if __name__ == "__main__":
     Training Configuration of main
     '''
 
-    parser.add_argument('--epoch', type=int, default=1500)
-    parser.add_argument('--num_train_iter', type=int, default=1024,
+    parser.add_argument('--epoch', type=int, default=10)
+    parser.add_argument('--num_train_iter', type=int, default=512,
                         help='total number of training iterations')
+    parser.add_argument('--eval_interval', type=int, default=10,
+                        help='run full validation every N epochs and at the final epoch')
     parser.add_argument('-nl', '--num_labels', type=int, default=3)
     parser.add_argument('-bsz', '--batch_size', type=int, default=2)
     parser.add_argument('--uratio', type=int, default=4,
@@ -242,6 +254,14 @@ if __name__ == "__main__":
     parser.add_argument('--update_m', type=str, default='L2')
     parser.add_argument('--threshold', type=float, default=0.95)
     parser.add_argument('--add_ulb', type=str2bool, default=False)
+    parser.add_argument('--use_fgmr', action='store_true')
+    parser.add_argument('--fgmr_weight', type=float, default=0.03)
+    parser.add_argument('--use_rac', action='store_true')
+    parser.add_argument('--use_dvad', action='store_true')
+    parser.add_argument('--dvad_final_margin', type=float, default=0.9)
+    parser.add_argument('--warmup_steps', type=int, default=512)
+    parser.add_argument('--use_dominant_filter', action='store_true',
+                        help='also require SCDR dominant-modality matching when DVAD is enabled')
     # parser.add_argument('--class_weight', type=list, default=[0.2, 0.5, 0.3])
 
 

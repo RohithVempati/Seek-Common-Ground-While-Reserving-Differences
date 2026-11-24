@@ -23,6 +23,55 @@ from models.nets import fusion_model, dmd
 from transformers import BertModel, BertTokenizer
 from tqdm import tqdm
 
+TOTAL_STEPS = 5120
+
+
+def fgmr_loss(visual_private_feat, text_private_feat, tau=0.1):
+    # tau is retained in the requested API; cosine alignment has no temperature term.
+    batch_size = visual_private_feat.shape[0]
+    visual_private_feat = visual_private_feat.reshape(batch_size, -1)
+    text_private_feat = text_private_feat.reshape(batch_size, -1).detach()
+    visual_private_feat = F.normalize(visual_private_feat, p=2, dim=1)
+    text_private_feat = F.normalize(text_private_feat, p=2, dim=1)
+    similarity = (visual_private_feat * text_private_feat).sum(dim=1)
+    return (1.0 - similarity).mean()
+
+
+def rac_calibrated_pseudo_label(logits_visual, logits_text, logits_fusion, temperature):
+    if temperature <= 0:
+        raise ValueError('RAC temperature must be greater than zero.')
+    probabilities = torch.stack((
+        torch.softmax(logits_visual / temperature, dim=1),
+        torch.softmax(logits_text / temperature, dim=1),
+        torch.softmax(logits_fusion / temperature, dim=1),
+    ), dim=1)
+    view_confidences = probabilities.max(dim=2).values
+    weights = torch.softmax(view_confidences / temperature, dim=1)
+    pseudo_probabilities = (probabilities * weights.unsqueeze(-1)).sum(dim=1)
+    conf, pseudo_label = pseudo_probabilities.max(dim=1)
+    return pseudo_probabilities, pseudo_label, conf, weights
+
+
+def masked_mean(losses, mask):
+    weights = mask.to(dtype=losses.dtype)
+    return (losses * weights).sum() / weights.sum().clamp_min(1.0)
+
+
+class DVADScheduler:
+    def __init__(self, warmup_steps=512, final_margin=0.9):
+        self.start_step = warmup_steps
+        self.end_step = int(0.9 * TOTAL_STEPS)
+        if self.start_step < 0 or self.start_step >= self.end_step:
+            raise ValueError('warmup_steps must be between 0 and the DVAD end step.')
+        self.initial_margin = 0.5
+        self.final_margin = final_margin
+
+    def margin(self, step):
+        progress = (step - self.start_step) / (self.end_step - self.start_step)
+        progress = min(max(progress, 0.0), 1.0)
+        return self.initial_margin + progress * (self.final_margin - self.initial_margin)
+
+
 class MSE(nn.Module):
     def __init__(self):
         super(MSE, self).__init__()
@@ -126,6 +175,7 @@ class S2_VER:
         self.clsacc = [[] for i in range(10)]
         self.logger = logger
         self.print_fn = print if logger is None else logger.info
+        self._pla_batch = None
 
         self.bn_controller = Bn_Controller()
 
@@ -138,6 +188,40 @@ class S2_VER:
         self.loader_dict = loader_dict
         self.print_fn(f'[!] data loader keys: {self.loader_dict.keys()}')
 
+    @torch.no_grad()
+    def evaluate_pla(self, args, max_samples=32):
+        if self._pla_batch is None:
+            _, images, texts, labels = next(iter(self.loader_dict['eval']))
+            self._pla_batch = (
+                images[:max_samples],
+                list(texts[:max_samples]),
+                labels[:max_samples],
+            )
+        images, texts, labels = self._pla_batch
+        images = images.cuda(args.gpu)
+        labels = labels.cuda(args.gpu)
+        text_inputs = self.tokenizer(texts, return_tensors='pt', padding=True, truncation=True)
+        text_inputs = {key: value.cuda(args.gpu) for key, value in text_inputs.items()}
+
+        self.model.eval()
+        self.ema.apply_shadow()
+        try:
+            output = self.model(images, text_inputs)
+            if args.use_rac:
+                _, predictions, _, _ = rac_calibrated_pseudo_label(
+                    output['logits_visual_private'],
+                    output['logits_text_private'],
+                    output['logits_fusion'],
+                    args.T,
+                )
+            else:
+                predictions = output['logits_fusion'].argmax(dim=1)
+            accuracy = (predictions == labels).float().mean().item()
+        finally:
+            self.ema.restore()
+            self.model.train()
+        return accuracy
+
     def set_dset(self, dset):
         self.ulb_dset = dset
 
@@ -148,6 +232,9 @@ class S2_VER:
     def train(self, args, epoch, best_eval_acc, logger=None):
 
         ngpus_per_node = torch.cuda.device_count()
+        if args.eval_interval <= 0:
+            raise ValueError('eval_interval must be greater than zero.')
+        dvad_scheduler = DVADScheduler(args.warmup_steps, args.dvad_final_margin)
 
         # EMA Init
         self.model.train()
@@ -191,6 +278,8 @@ class S2_VER:
         for (_, x_lb, t_lb, y_lb), (x_ulb_idx, x_ulb_w, x_ulb_s0, x_ulb_s1, t_ulb, y_ulb) in tqdm(zip(self.loader_dict['train_lb'],
                                                                     self.loader_dict['train_ulb']), total=len(self.loader_dict['train_ulb'])):
             # break
+            step = self.it
+            display_step = step + 1
             iter_num += 1
             end_batch.record()
             torch.cuda.synchronize()
@@ -225,9 +314,9 @@ class S2_VER:
                 # res = self.fusion_model(img_inputs, text_input)
                 output = self.model(img_inputs, text_input)
                 # logits_m = output['pre_m']
-                logits_m = output['pre_m_att']
-                logits_t = output['pre_t']
-                logits_v = output['pre_v']
+                logits_m = output['logits_fusion']
+                logits_t = output['logits_text_private']
+                logits_v = output['logits_visual_private']
 
                 features_m = output['c_l'] + output['c_v']
                 features_t = output['c_l']
@@ -299,27 +388,70 @@ class S2_VER:
                     t_scores, t_lbs_u_guess = torch.max(t_ulb_probs, dim=1)
                     v_scores, v_lbs_u_guess = torch.max(v_ulb_probs, dim=1)
 
-                    if epoch <= 10:
-                        persudo_filter_threshold = 1 * sup_loss
+                    fusion_lbs = lbs_u_guess
+                    fusion_scores = scores
+                    if args.use_rac:
+                        _, lbs_u_guess, rac_conf, _ = rac_calibrated_pseudo_label(
+                            logits_v_ulb_w, logits_t_ulb_w, logits_x_ulb_w, args.T)
+                        scores = rac_conf
+                    else:
+                        rac_conf = fusion_scores
+
+                    apply_dominant_filter = (
+                        (args.use_dvad and args.use_dominant_filter) or
+                        (not args.use_dvad and epoch <= 10)
+                    )
+                    dominant_mask = torch.ones_like(scores, dtype=torch.bool)
+                    if apply_dominant_filter:
+                        persudo_filter_threshold = sup_loss
                         for i,idx in enumerate(modal_index_x_ulb_w):
                             if idx == 2:
-                                loss_m_in_t = ce_loss(pre_m_in_t[i], t_lbs_u_guess[i])
-                                loss_m_in_v = ce_loss(pre_m_in_v[i], v_lbs_u_guess[i])
+                                loss_m_in_t = ce_loss(pre_m_in_t[i], lbs_u_guess[i])
+                                loss_m_in_v = ce_loss(pre_m_in_v[i], lbs_u_guess[i])
                                 if loss_m_in_t > persudo_filter_threshold or loss_m_in_v > persudo_filter_threshold:
-                                    scores[i] = 0
+                                    dominant_mask[i] = False
 
                     threshold = args.threshold
-                    mask = scores.ge(threshold)
-                    t_mask = t_scores.ge(threshold)
-                    v_mask = v_scores.ge(threshold)
+                    warmup_active = (args.use_rac or args.use_dvad) and step < args.warmup_steps
+                    if args.use_dvad:
+                        mask = (lbs_u_guess == fusion_lbs) & rac_conf.gt(dvad_scheduler.margin(step))
+                        if args.use_dominant_filter:
+                            mask = mask & dominant_mask
+                    elif args.use_rac:
+                        mask = scores.ge(threshold) & dominant_mask
+                    else:
+                        scores = scores.masked_fill(~dominant_mask, 0)
+                        mask = scores.ge(threshold)
+
+                    if warmup_active:
+                        mask = torch.zeros_like(mask)
+                    if args.use_rac or args.use_dvad:
+                        t_mask = mask
+                        v_mask = mask
+                    else:
+                        t_mask = t_scores.ge(threshold)
+                        v_mask = v_scores.ge(threshold)
 
                     y_ulb = y_ulb.cuda(args.gpu)
                     pseudo_true_ratios.update(((lbs_u_guess == y_ulb) * mask).sum() / (mask.sum()+1e-7))
 
-                unsup_loss_m = F.cross_entropy(logits_x_ulb_s0, lbs_u_guess, reduction='none') * mask
-                unsup_loss_t = F.cross_entropy(logits_t_ulb_s0, t_lbs_u_guess, reduction='none') * t_mask
-                unsup_loss_v = F.cross_entropy(logits_v_ulb_s0, v_lbs_u_guess, reduction='none') * v_mask
-                unsup_loss = unsup_loss_m.mean() + unsup_loss_t.mean() + unsup_loss_v.mean()
+                if warmup_active:
+                    unsup_loss = logits_x_ulb_s0.sum() * 0.0
+                elif args.use_rac or args.use_dvad:
+                    unsup_loss_m = F.cross_entropy(logits_x_ulb_s0, lbs_u_guess, reduction='none')
+                    unsup_loss_t = F.cross_entropy(logits_t_ulb_s0, lbs_u_guess, reduction='none')
+                    unsup_loss_v = F.cross_entropy(logits_v_ulb_s0, lbs_u_guess, reduction='none')
+                    unsup_loss = (masked_mean(unsup_loss_m, mask) +
+                                  masked_mean(unsup_loss_t, mask) +
+                                  masked_mean(unsup_loss_v, mask))
+                else:
+                    unsup_loss_m = F.cross_entropy(logits_x_ulb_s0, lbs_u_guess, reduction='none') * mask
+                    unsup_loss_t = F.cross_entropy(logits_t_ulb_s0, t_lbs_u_guess, reduction='none') * t_mask
+                    unsup_loss_v = F.cross_entropy(logits_v_ulb_s0, v_lbs_u_guess, reduction='none') * v_mask
+                    unsup_loss = unsup_loss_m.mean() + unsup_loss_t.mean() + unsup_loss_v.mean()
+
+                fgmr = fgmr_loss(output['visual_private_feat'], output['text_private_feat']) \
+                    if args.use_fgmr else logits_x_lb.new_zeros(())
 
                 # decouple loss
                 # reconstruction loss
@@ -361,7 +493,8 @@ class S2_VER:
 
                 decouple_loss = loss_s_sr + loss_recon + (loss_sim+loss_ort) * 0.1 
 
-                total_loss = sup_loss + self.lambda_u * unsup_loss + decouple_loss
+                total_loss = (sup_loss + self.lambda_u * unsup_loss +
+                              args.fgmr_weight * fgmr + decouple_loss)
                 # only attention
                 # total_loss = sup_loss + self.lambda_u * unsup_loss_m.mean() + decouple_loss
                 # only SMC
@@ -394,6 +527,22 @@ class S2_VER:
             self.scheduler.step()
             self.ema.update()
             self.model.zero_grad()
+            self.it += 1
+
+            if display_step % 100 == 0:
+                accepted_fraction = mask.float().mean().item()
+                mean_rac_conf = rac_conf.mean().item()
+                confidence_view = 'RAC' if args.use_rac else 'fusion'
+                self.print_fn(
+                    "Step {}: sup_loss={}, unsup_loss={}, fgmr_loss={}, "
+                    "decouple_loss={}, total_loss={}, accepted_fraction={}, "
+                    "mean_{}_conf={}, dvad_margin={}".format(
+                        display_step, sup_loss.item(), unsup_loss.item(), fgmr.item(),
+                        decouple_loss.item(), total_loss.item(), accepted_fraction,
+                        confidence_view, mean_rac_conf, dvad_scheduler.margin(step)))
+            if display_step % 500 == 0 or display_step == args.epoch * args.num_train_iter:
+                self.print_fn("Step {}: held-out PLA ({} samples)={}".format(
+                    display_step, 32, self.evaluate_pla(args)))
 
             end_run.record()
             torch.cuda.synchronize()
@@ -406,6 +555,9 @@ class S2_VER:
 
         self.print_fn("Epoch {}/{} train: data time: {}, model time: {}, last lr: {}, labeled loss: {}, unlabeled loss: {}, decouple_loss: {}, total_loss: {}, mask ratio: {}, pseudo label correct ratio: {}".
                       format(epoch, args.epoch, batch_data_time.avg, batch_model_time.avg, lr_last, sup_losses.avg, unsup_losses.avg, decouple_losses.avg,total_losses.avg, mask_ratios.avg, pseudo_true_ratios.avg))
+
+        if (epoch + 1) % args.eval_interval != 0 and epoch + 1 != args.epoch:
+            return best_eval_acc
 
         eval_dict = self.evaluate(args=args)
         best_eval_acc = max(best_eval_acc, eval_dict['eval/top-1-acc'])

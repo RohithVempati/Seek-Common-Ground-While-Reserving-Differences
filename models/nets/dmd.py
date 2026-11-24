@@ -187,6 +187,11 @@ class DMD(nn.Module):
             'pre_v_in_m': pre_v_in_m,
             'pre_t_in_m': pre_t_in_m,
 
+            'logits_visual_private': pre_v,
+            'logits_text_private': pre_t,
+            'logits_fusion': pre_m_att,
+            'visual_private_feat': s_v,
+            'text_private_feat': s_l,
             'modal_index': modal_index
         }
         return res
