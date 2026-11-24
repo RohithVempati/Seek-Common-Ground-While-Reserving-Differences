@@ -23,9 +23,6 @@ from models.nets import fusion_model, dmd
 from transformers import BertModel, BertTokenizer
 from tqdm import tqdm
 
-TOTAL_STEPS = 5120
-
-
 def fgmr_loss(visual_private_feat, text_private_feat, tau=0.1):
     # tau is retained in the requested API; cosine alignment has no temperature term.
     batch_size = visual_private_feat.shape[0]
@@ -58,18 +55,30 @@ def masked_mean(losses, mask):
 
 
 class DVADScheduler:
-    def __init__(self, warmup_steps=512, final_margin=0.9):
+    def __init__(self, total_steps, warmup_steps=512, final_margin=0.7,
+                 mode='margin', percentile_start=20.0, percentile_end=80.0):
+        self.total_steps = total_steps
         self.start_step = warmup_steps
-        self.end_step = int(0.9 * TOTAL_STEPS)
+        self.end_step = int(0.9 * total_steps)
         if self.start_step < 0 or self.start_step >= self.end_step:
             raise ValueError('warmup_steps must be between 0 and the DVAD end step.')
         self.initial_margin = 0.5
         self.final_margin = final_margin
+        self.mode = mode
+        self.percentile_start = percentile_start
+        self.percentile_end = percentile_end
 
     def margin(self, step):
         progress = (step - self.start_step) / (self.end_step - self.start_step)
         progress = min(max(progress, 0.0), 1.0)
         return self.initial_margin + progress * (self.final_margin - self.initial_margin)
+
+    def percentile(self, step):
+        progress = (step - self.start_step) / (self.end_step - self.start_step)
+        progress = min(max(progress, 0.0), 1.0)
+        percentile = self.percentile_start + progress * (
+            self.percentile_end - self.percentile_start)
+        return min(max(percentile, 0.0), 100.0)
 
 
 class MSE(nn.Module):
@@ -189,13 +198,26 @@ class S2_VER:
         self.print_fn(f'[!] data loader keys: {self.loader_dict.keys()}')
 
     @torch.no_grad()
-    def evaluate_pla(self, args, max_samples=32):
+    def evaluate_pla(self, args, step, max_samples=256):
         if self._pla_batch is None:
-            _, images, texts, labels = next(iter(self.loader_dict['eval']))
+            cached_images = []
+            cached_texts = []
+            cached_labels = []
+            sample_count = 0
+            for _, images, texts, labels in self.loader_dict['eval']:
+                take = min(max_samples - sample_count, labels.shape[0])
+                cached_images.append(images[:take])
+                cached_texts.extend(texts[:take])
+                cached_labels.append(labels[:take])
+                sample_count += take
+                if sample_count >= max_samples:
+                    break
+            if sample_count == 0:
+                raise ValueError('The evaluation loader has no samples for PLA.')
             self._pla_batch = (
-                images[:max_samples],
-                list(texts[:max_samples]),
-                labels[:max_samples],
+                torch.cat(cached_images, dim=0),
+                cached_texts,
+                torch.cat(cached_labels, dim=0),
             )
         images, texts, labels = self._pla_batch
         images = images.cuda(args.gpu)
@@ -212,15 +234,39 @@ class S2_VER:
                     output['logits_visual_private'],
                     output['logits_text_private'],
                     output['logits_fusion'],
-                    args.T,
+                    args.rac_temperature,
                 )
             else:
                 predictions = output['logits_fusion'].argmax(dim=1)
             accuracy = (predictions == labels).float().mean().item()
+            visual_logits = output['logits_visual_private']
+            text_logits = output['logits_text_private']
+            fusion_logits = output['logits_fusion']
+            view_accuracies = [
+                (logits.argmax(dim=1) == labels).float().mean().item()
+                for logits in (visual_logits, text_logits, fusion_logits)
+            ]
+            view_confidences = [
+                torch.softmax(logits, dim=1).max(dim=1).values.mean().item()
+                for logits in (visual_logits, text_logits, fusion_logits)
+            ]
+            self.print_fn(
+                "Step {}: VIEWS acc(v/t/f)={:.3f}/{:.3f}/{:.3f} "
+                "conf(v/t/f)={:.3f}/{:.3f}/{:.3f}".format(
+                    step, *view_accuracies, *view_confidences))
         finally:
             self.ema.restore()
             self.model.train()
         return accuracy
+
+    @torch.no_grad()
+    def _diagnostic_forward(self, images, text_inputs):
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            return self.model(images, text_inputs)
+        finally:
+            self.model.train(was_training)
 
     def set_dset(self, dset):
         self.ulb_dset = dset
@@ -234,7 +280,10 @@ class S2_VER:
         ngpus_per_node = torch.cuda.device_count()
         if args.eval_interval <= 0:
             raise ValueError('eval_interval must be greater than zero.')
-        dvad_scheduler = DVADScheduler(args.warmup_steps, args.dvad_final_margin)
+        TOTAL_STEPS = args.epoch * args.num_train_iter
+        dvad_scheduler = DVADScheduler(
+            TOTAL_STEPS, args.warmup_steps, args.dvad_final_margin,
+            args.dvad_mode, args.dvad_percentile_start, args.dvad_percentile_end)
 
         # EMA Init
         self.model.train()
@@ -262,6 +311,7 @@ class S2_VER:
         batch_model_time = AverageMeter()
 
         pseudo_true_ratios = AverageMeter()
+        rac_conf_values = []
 
         start_batch.record()
 
@@ -318,6 +368,24 @@ class S2_VER:
                 logits_t = output['logits_text_private']
                 logits_v = output['logits_visual_private']
 
+                if display_step == 1:
+                    diag_text_inputs = {
+                        key: value[:num_lb] for key, value in text_input.items()}
+                    diagnostic_output = self._diagnostic_forward(x_lb, diag_text_inputs)
+                    vis_counts = diagnostic_output['logits_visual_private'].argmax(
+                        dim=1).bincount(minlength=3).tolist()
+                    text_counts = diagnostic_output['logits_text_private'].argmax(
+                        dim=1).bincount(minlength=3).tolist()
+                    fusion_counts = diagnostic_output['logits_fusion'].argmax(
+                        dim=1).bincount(minlength=3).tolist()
+                    label_counts = y_lb.bincount(minlength=3).tolist()
+                    self.print_fn(
+                        "DIAG step=1: vis_pred_counts={}, text_pred_counts={}, "
+                        "fusion_pred_counts={}, label_counts={}".format(
+                            vis_counts, text_counts, fusion_counts, label_counts))
+                    self.print_fn("FGMR anchor = {}, weight = {}".format(
+                        args.fgmr_anchor, args.fgmr_weight))
+
                 features_m = output['c_l'] + output['c_v']
                 features_t = output['c_l']
                 features_v = output['c_v']
@@ -370,6 +438,22 @@ class S2_VER:
                     logits_t_ulb_w = logits_t_ulb_w.detach()
                     logits_v_ulb_w = logits_v_ulb_w.detach()
 
+                    if display_step == 1000:
+                        diag_text_inputs = {
+                            key: value[num_lb:num_lb + num_ulb]
+                            for key, value in text_input.items()}
+                        diagnostic_output = self._diagnostic_forward(
+                            x_ulb_w, diag_text_inputs)
+                        vis_counts = diagnostic_output['logits_visual_private'].argmax(
+                            dim=1).bincount(minlength=3).tolist()
+                        text_counts = diagnostic_output['logits_text_private'].argmax(
+                            dim=1).bincount(minlength=3).tolist()
+                        fusion_counts = diagnostic_output['logits_fusion'].argmax(
+                            dim=1).bincount(minlength=3).tolist()
+                        self.print_fn(
+                            "DIAG step=1000: vis={}, text={}, fusion={}".format(
+                                vis_counts, text_counts, fusion_counts))
+
                     modal_index_x_ulb_w = modal_index_x_ulb_w.detach()
 
                     features_lb = features_lb.detach()
@@ -390,12 +474,16 @@ class S2_VER:
 
                     fusion_lbs = lbs_u_guess
                     fusion_scores = scores
+                    _, rac_lbs, rac_conf, _ = rac_calibrated_pseudo_label(
+                        logits_v_ulb_w, logits_t_ulb_w, logits_x_ulb_w,
+                        args.rac_temperature)
+                    rac_conf_values.append(rac_conf.detach().float())
                     if args.use_rac:
-                        _, lbs_u_guess, rac_conf, _ = rac_calibrated_pseudo_label(
-                            logits_v_ulb_w, logits_t_ulb_w, logits_x_ulb_w, args.T)
+                        lbs_u_guess = rac_lbs
                         scores = rac_conf
+                        gate_conf = rac_conf
                     else:
-                        rac_conf = fusion_scores
+                        gate_conf = fusion_scores
 
                     apply_dominant_filter = (
                         (args.use_dvad and args.use_dominant_filter) or
@@ -413,8 +501,16 @@ class S2_VER:
 
                     threshold = args.threshold
                     warmup_active = (args.use_rac or args.use_dvad) and step < args.warmup_steps
+                    dvad_percentile = None
+                    batch_threshold = None
                     if args.use_dvad:
-                        mask = (lbs_u_guess == fusion_lbs) & rac_conf.gt(dvad_scheduler.margin(step))
+                        if args.dvad_mode == 'margin':
+                            mask = (lbs_u_guess == fusion_lbs) & gate_conf.gt(dvad_scheduler.margin(step))
+                        else:
+                            dvad_percentile = dvad_scheduler.percentile(step)
+                            batch_threshold = torch.quantile(
+                                rac_conf.detach().float(), dvad_percentile / 100.0)
+                            mask = (lbs_u_guess == fusion_lbs) & rac_conf.ge(batch_threshold)
                         if args.use_dominant_filter:
                             mask = mask & dominant_mask
                     elif args.use_rac:
@@ -450,8 +546,11 @@ class S2_VER:
                     unsup_loss_v = F.cross_entropy(logits_v_ulb_s0, v_lbs_u_guess, reduction='none') * v_mask
                     unsup_loss = unsup_loss_m.mean() + unsup_loss_t.mean() + unsup_loss_v.mean()
 
-                fgmr = fgmr_loss(output['visual_private_feat'], output['text_private_feat']) \
-                    if args.use_fgmr else logits_x_lb.new_zeros(())
+                fgmr = logits_x_lb.new_zeros(())
+                if args.use_fgmr:
+                    text_anchor = (output['text_private_feat'] if args.fgmr_anchor == 's_l'
+                                   else output['c_l'])
+                    fgmr = fgmr_loss(output['visual_private_feat'], text_anchor)
 
                 # decouple loss
                 # reconstruction loss
@@ -533,16 +632,27 @@ class S2_VER:
                 accepted_fraction = mask.float().mean().item()
                 mean_rac_conf = rac_conf.mean().item()
                 confidence_view = 'RAC' if args.use_rac else 'fusion'
-                self.print_fn(
-                    "Step {}: sup_loss={}, unsup_loss={}, fgmr_loss={}, "
-                    "decouple_loss={}, total_loss={}, accepted_fraction={}, "
-                    "mean_{}_conf={}, dvad_margin={}".format(
-                        display_step, sup_loss.item(), unsup_loss.item(), fgmr.item(),
-                        decouple_loss.item(), total_loss.item(), accepted_fraction,
-                        confidence_view, mean_rac_conf, dvad_scheduler.margin(step)))
-            if display_step % 500 == 0 or display_step == args.epoch * args.num_train_iter:
+                if args.use_dvad and args.dvad_mode == 'percentile':
+                    self.print_fn(
+                        "Step {}: sup_loss={}, unsup_loss={}, fgmr_loss={}, "
+                        "decouple_loss={}, total_loss={}, accepted_fraction={}, "
+                        "mean_{}_conf={}, dvad_margin={}, p={}, batch_threshold={}".format(
+                            display_step, sup_loss.item(), unsup_loss.item(), fgmr.item(),
+                            decouple_loss.item(), total_loss.item(), accepted_fraction,
+                            confidence_view, mean_rac_conf, dvad_scheduler.margin(step),
+                            dvad_percentile, batch_threshold.item()))
+                else:
+                    self.print_fn(
+                        "Step {}: sup_loss={}, unsup_loss={}, fgmr_loss={}, "
+                        "decouple_loss={}, total_loss={}, accepted_fraction={}, "
+                        "mean_{}_conf={}, dvad_margin={}".format(
+                            display_step, sup_loss.item(), unsup_loss.item(), fgmr.item(),
+                            decouple_loss.item(), total_loss.item(), accepted_fraction,
+                            confidence_view, mean_rac_conf, dvad_scheduler.margin(step)))
+            if display_step % 500 == 0 or step + 1 >= TOTAL_STEPS:
+                pla = self.evaluate_pla(args, display_step)
                 self.print_fn("Step {}: held-out PLA ({} samples)={}".format(
-                    display_step, 32, self.evaluate_pla(args)))
+                    display_step, self._pla_batch[2].shape[0], pla))
 
             end_run.record()
             torch.cuda.synchronize()
@@ -553,6 +663,14 @@ class S2_VER:
 
         # self.print_fn(self.relation_matrix)
 
+        conf_deciles = torch.quantile(
+            torch.cat(rac_conf_values),
+            torch.arange(10, dtype=torch.float32, device=rac_conf_values[0].device) / 10.0,
+        ).cpu().tolist()
+        formatted_deciles = '[{}]'.format(
+            ', '.join('{:.3f}'.format(value) for value in conf_deciles))
+        self.print_fn("Epoch {}: RAC conf deciles = {}, dvad_margin_final = {}".format(
+            epoch + 1, formatted_deciles, args.dvad_final_margin))
         self.print_fn("Epoch {}/{} train: data time: {}, model time: {}, last lr: {}, labeled loss: {}, unlabeled loss: {}, decouple_loss: {}, total_loss: {}, mask ratio: {}, pseudo label correct ratio: {}".
                       format(epoch, args.epoch, batch_data_time.avg, batch_model_time.avg, lr_last, sup_losses.avg, unsup_losses.avg, decouple_losses.avg,total_losses.avg, mask_ratios.avg, pseudo_true_ratios.avg))
 

@@ -1,6 +1,6 @@
-# SCDR+A2SI runs are capped at 5,120 optimizer steps (10 epochs x 512 steps),
-# about 30 minutes at the target hardware throughput. A2SI's roughly 70-epoch
-# DVAD schedule is compressed here; results are not directly comparable.
+# At the default 10 x 512 steps, SCDR+A2SI takes about 30 minutes on the target
+# hardware. DVAD scales with configured steps; results aren't comparable to
+# A2SI's roughly 70-epoch schedule.
 
 # import needed library
 import os
@@ -18,7 +18,7 @@ import torch.multiprocessing as mp
 
 from utils import net_builder, get_logger, count_parameters, over_write_args_from_file
 from train_utils import TBLog, get_optimizer, get_cosine_schedule_with_warmup
-from models.main.main import S2_VER, TOTAL_STEPS
+from models.main.main import S2_VER
 from datasets.ssl_dataset import SSL_Dataset, ImageNetLoader, Emotion_SSL_Dataset
 from datasets.data_utils import get_data_loader
 
@@ -29,12 +29,6 @@ FI数据集与cifar10的切换: net部分，调整stride；数据集部分，SSL
 # os.environ['CUDA_VISIBLE_DEVICES'] = "0" 
 
 def main(args):
-    configured_steps = args.epoch * args.num_train_iter
-    if configured_steps > TOTAL_STEPS:
-        raise ValueError(
-            'Training is capped at {} steps; got {} (epoch * num_train_iter).'.format(
-                TOTAL_STEPS, configured_steps))
-
     '''
     For (Distributed)DataParallelism,
     main(args) spawn each process (main_worker) to each GPU.
@@ -256,9 +250,14 @@ if __name__ == "__main__":
     parser.add_argument('--add_ulb', type=str2bool, default=False)
     parser.add_argument('--use_fgmr', action='store_true')
     parser.add_argument('--fgmr_weight', type=float, default=0.03)
+    parser.add_argument('--fgmr_anchor', choices=['s_l', 'c_l'], default='s_l')
     parser.add_argument('--use_rac', action='store_true')
+    parser.add_argument('--rac_temperature', type=float, default=1.0)
     parser.add_argument('--use_dvad', action='store_true')
-    parser.add_argument('--dvad_final_margin', type=float, default=0.9)
+    parser.add_argument('--dvad_final_margin', type=float, default=0.7)
+    parser.add_argument('--dvad_mode', choices=['margin', 'percentile'], default='margin')
+    parser.add_argument('--dvad_percentile_start', type=float, default=20.0)
+    parser.add_argument('--dvad_percentile_end', type=float, default=80.0)
     parser.add_argument('--warmup_steps', type=int, default=512)
     parser.add_argument('--use_dominant_filter', action='store_true',
                         help='also require SCDR dominant-modality matching when DVAD is enabled')
