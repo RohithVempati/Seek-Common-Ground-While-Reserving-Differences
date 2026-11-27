@@ -255,7 +255,9 @@ if __name__ == "__main__":
     parser.add_argument('--rac_temperature', type=float, default=1.0)
     parser.add_argument('--use_dvad', action='store_true')
     parser.add_argument('--dvad_final_margin', type=float, default=0.7)
-    parser.add_argument('--dvad_mode', choices=['margin', 'percentile'], default='margin')
+    parser.add_argument('--dvad_mode',
+                        choices=['margin', 'percentile', 'hybrid_fallback'],
+                        default='margin')
     parser.add_argument('--dvad_percentile_start', type=float, default=20.0)
     parser.add_argument('--dvad_percentile_end', type=float, default=80.0)
     parser.add_argument('--warmup_steps', type=int, default=512)

@@ -506,11 +506,27 @@ class S2_VER:
                     if args.use_dvad:
                         if args.dvad_mode == 'margin':
                             mask = (lbs_u_guess == fusion_lbs) & gate_conf.gt(dvad_scheduler.margin(step))
-                        else:
+                            fallback_active = False
+                            fixed_mask = None
+                        elif args.dvad_mode == 'percentile':
                             dvad_percentile = dvad_scheduler.percentile(step)
                             batch_threshold = torch.quantile(
                                 rac_conf.detach().float(), dvad_percentile / 100.0)
                             mask = (lbs_u_guess == fusion_lbs) & rac_conf.ge(batch_threshold)
+                            fallback_active = False
+                            fixed_mask = None
+                        else:  # hybrid_fallback
+                            fixed_mask = gate_conf.gt(args.threshold)
+                            if fixed_mask.sum() == 0:
+                                fallback_p = args.dvad_percentile_end
+                                fallback_threshold = torch.quantile(
+                                    gate_conf.float(), fallback_p / 100.0)
+                                fallback_mask = gate_conf.ge(fallback_threshold)
+                                mask = (lbs_u_guess == fusion_lbs) & fallback_mask
+                                fallback_active = True
+                            else:
+                                mask = (lbs_u_guess == fusion_lbs) & fixed_mask
+                                fallback_active = False
                         if args.use_dominant_filter:
                             mask = mask & dominant_mask
                     elif args.use_rac:
@@ -632,23 +648,23 @@ class S2_VER:
                 accepted_fraction = mask.float().mean().item()
                 mean_rac_conf = rac_conf.mean().item()
                 confidence_view = 'RAC' if args.use_rac else 'fusion'
-                if args.use_dvad and args.dvad_mode == 'percentile':
-                    self.print_fn(
-                        "Step {}: sup_loss={}, unsup_loss={}, fgmr_loss={}, "
-                        "decouple_loss={}, total_loss={}, accepted_fraction={}, "
-                        "mean_{}_conf={}, dvad_margin={}, p={}, batch_threshold={}".format(
-                            display_step, sup_loss.item(), unsup_loss.item(), fgmr.item(),
-                            decouple_loss.item(), total_loss.item(), accepted_fraction,
-                            confidence_view, mean_rac_conf, dvad_scheduler.margin(step),
-                            dvad_percentile, batch_threshold.item()))
+                if not args.use_dvad or args.dvad_mode == 'margin':
+                    _dvad_extra = f"dvad_margin={dvad_scheduler.margin(step):.4f}"
+                elif args.dvad_mode == 'percentile':
+                    _dvad_extra = (
+                        f"p={dvad_percentile:.2f}, "
+                        f"batch_threshold={batch_threshold.item():.4f}")
                 else:
-                    self.print_fn(
-                        "Step {}: sup_loss={}, unsup_loss={}, fgmr_loss={}, "
-                        "decouple_loss={}, total_loss={}, accepted_fraction={}, "
-                        "mean_{}_conf={}, dvad_margin={}".format(
-                            display_step, sup_loss.item(), unsup_loss.item(), fgmr.item(),
-                            decouple_loss.item(), total_loss.item(), accepted_fraction,
-                            confidence_view, mean_rac_conf, dvad_scheduler.margin(step)))
+                    _dvad_extra = (
+                        f"fallback_active={int(fallback_active)}, "
+                        f"n_fixed={int(fixed_mask.sum())}")
+                self.print_fn(
+                    "Step {}: sup_loss={}, unsup_loss={}, fgmr_loss={}, "
+                    "decouple_loss={}, total_loss={}, accepted_fraction={}, "
+                    "mean_{}_conf={}, {}".format(
+                        display_step, sup_loss.item(), unsup_loss.item(), fgmr.item(),
+                        decouple_loss.item(), total_loss.item(), accepted_fraction,
+                        confidence_view, mean_rac_conf, _dvad_extra))
             if display_step % 500 == 0 or step + 1 >= TOTAL_STEPS:
                 pla = self.evaluate_pla(args, display_step)
                 self.print_fn("Step {}: held-out PLA ({} samples)={}".format(
